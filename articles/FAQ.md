@@ -1,5 +1,20 @@
 # Perguntas frequentes
 
+## Como instalar a versão DEV no Windows sem Rtools?
+
+Use um binário `.zip` para Windows fornecido pelo mantenedor, compatível
+com a versão e a arquitetura do seu R. Instale primeiro as dependências
+e depois o arquivo com
+`install.packages(file.choose(), repos = NULL, type = "win.binary")`,
+sem descompactá-lo. A instalação de um arquivo local não instala
+dependências automaticamente. Consulte os comandos completos na [seção
+Windows da página
+inicial](https://rfsaldanha.github.io/microdatasus/index.html#windows).
+
+A instalação pelo GitHub usa o código-fonte e requer Rtools. Para
+informar seu ambiente ao solicitar um binário, execute
+`R.version.string` e `R.version$arch`.
+
 ## O período e a UF do download são necessariamente os do evento?
 
 Não. Os argumentos de
@@ -24,9 +39,8 @@ sim_raw <- fetch_datasus(
 )
 
 sim <- process_sim(sim_raw)
-sim$DTOBITO <- as.Date(sim$DTOBITO)
 
-sim_2020 <- sim[format(sim$DTOBITO, "%Y") == "2020", ]
+sim_2020 <- sim[!is.na(sim$DTOBITO) & format(sim$DTOBITO, "%Y") == "2020", ]
 ```
 
 Os capítulos do livro sobre
@@ -88,8 +102,8 @@ um arquivo ausente ou inválido.
 ## O que acontece quando apenas parte do download falha?
 
 Com `stop_on_error = FALSE`, que é o padrão, os arquivos válidos são
-retornados e as falhas são resumidas ao final. Se nenhum arquivo for
-lido, o retorno é `NULL`.
+retornados e as falhas são resumidas ao final. No modo padrão,
+`collect = TRUE`, o retorno é `NULL` quando não há registros a retornar.
 
 ``` r
 
@@ -108,8 +122,43 @@ if (is.null(dados)) {
 }
 ```
 
-Com `stop_on_error = TRUE`, uma falha de listagem, download ou leitura
-interrompe a chamada.
+Com `stop_on_error = TRUE`, uma falha de listagem, download, leitura ou
+processamento interrompe a chamada. Combinações de UF e período que não
+constam da listagem geram avisos em ambos os modos; confira a cobertura
+dos resultados.
+
+## E quando o computador está sem internet ou o DataSUS está indisponível?
+
+Com `stop_on_error = FALSE` e `collect = TRUE`,
+[`fetch_datasus()`](https://rfsaldanha.github.io/microdatasus/reference/fetch_datasus.md)
+informa as falhas de conexão com avisos e retorna `NULL` quando não há
+registros a retornar. Verifique esse retorno antes de chamar uma função
+`process_*()`. Ter acesso à internet não garante acesso ao FTP do
+DataSUS: o servidor também pode estar indisponível ou bloquear conexões
+de determinadas redes ou países.
+
+Os exemplos de download da ajuda só executam em sessões interativas com
+acesso à internet. Os testes automáticos usam arquivos locais e conexões
+simuladas; os testes que acessam o DataSUS precisam ser ativados
+explicitamente e não executam no CRAN. Assim, os exemplos e testes do
+pacote não dependem da disponibilidade do servidor. A verificação de
+links da documentação é separada e ainda pode apontar endereços
+indisponíveis.
+
+Ter arquivos DBC no cache não torna
+[`fetch_datasus()`](https://rfsaldanha.github.io/microdatasus/reference/fetch_datasus.md)
+offline: ela continua consultando as listagens remotas. Use
+[`read_dbc()`](https://rfsaldanha.github.io/microdatasus/reference/read_dbc.md)
+para arquivos locais ou
+[`readRDS()`](https://rdrr.io/r/base/readRDS.html) para resultados
+salvos. Os processadores podem precisar de dicionários ainda não
+armazenados; nesse caso, uma chamada direta pode falhar. Veja [como
+preparar o
+cache](https://rfsaldanha.github.io/microdatasus/articles/dicionarios-cache-e-escala.md).
+
+As tabelas de referência incluídas no pacote, como `tabMun`, podem ser
+usadas sem conexão. O pacote também inclui os arquivos de origem
+necessários para reconstruir essa referência municipal.
 
 ## Como saber de qual arquivo veio cada linha?
 
@@ -149,7 +198,14 @@ dados <- fetch_datasus(
 ```
 
 Para muitos anos, meses ou UFs, baixe lotes menores e grave cada lote em
-um banco de dados. O exemplo abaixo usa SQLite:
+um banco de dados. Outra opção é
+`fetch_datasus(process = TRUE, collect = FALSE, destination = "dados")`,
+que grava um RDS por arquivo e retorna um manifesto. O maior DBC
+descomprimido, os dicionários e os objetos temporários ainda devem caber
+em memória.
+
+O exemplo abaixo usa SQLite e processa o layout completo antes de
+selecionar as colunas de saída:
 
 ``` r
 
@@ -174,6 +230,8 @@ for (i in seq_len(nrow(grade))) {
     uf = grade$uf[i],
     information_system = "SIH-RD",
     vars = c("MUNIC_RES", "DT_INTER", "DIAG_PRINC", "SEXO"),
+    process = TRUE,
+    process_args = list(municipality_data = FALSE, labels = "character"),
     track_source = TRUE,
     timeout = 600,
     stop_on_error = FALSE
@@ -183,7 +241,6 @@ for (i in seq_len(nrow(grade))) {
     next
   }
 
-  lote <- process_sih(lote)
   dbWriteTable(
     con,
     "sih",
@@ -211,25 +268,66 @@ tbl(con, "sih") |>
 dbDisconnect(con)
 ```
 
-## Por que as colunas processadas são texto?
+## Como acelerar o processamento?
 
-As funções `process_*()` recodificam valores conhecidos e normalizam
-sequências Unicode em todas as colunas. Essa etapa final retorna um
-tibble de colunas `character`.
+As funções já convertem datas repetidas uma vez por campo e formato,
+restringem o desescape de texto e usam operações vetorizadas em códigos
+e limites CNV. Essas otimizações não exigem um argumento adicional.
 
-Converta somente o que a análise exige:
+Ative o cache persistente para reutilizar dicionários:
+
+``` r
+
+options(microdatasus.cache_dir = datasus_cache_dir(create = TRUE))
+```
+
+Desative apenas o que sua análise não precisa:
+`municipality_data = FALSE` omite atributos territoriais, e
+`diagnostics = FALSE` (padrão) evita construir o relatório. Use
+`labels = "none"` se quiser os códigos categóricos. Essa opção não
+garante execução sem rede: SIA, CNES e SINAN ainda consultam os DEFs e
+podem avaliar suas relações.
+
+Ao medir desempenho, separe a leitura do DBC da primeira chamada do
+processador e das chamadas com dicionários já em cache. Sempre reutilize
+a entrada bruta. Consulte o exemplo de medição em [Dicionários, cache e
+processamento em
+escala](https://rfsaldanha.github.io/microdatasus/articles/dicionarios-cache-e-escala.md).
+
+## `vars` sempre reduz a memória de leitura?
+
+Sem `process` e sem `row_filter`, as colunas solicitadas são
+selecionadas pelo leitor de DBC. Com processamento ou filtro, o layout
+completo é lido e `vars` seleciona a saída depois dessas etapas. Isso
+permite usar campos derivados e conservar as colunas necessárias às
+relações históricas. Selecionar poucas colunas de saída não torna a
+leitura inicial menor nesse segundo caso.
+
+## Quais tipos as funções de processamento retornam?
+
+As funções `process_*()` mantêm tipos coerentes com o papel de cada
+campo. Datas completas são `Date`; contagens e componentes de idade são
+inteiros; valores contínuos podem ser `double`; identificadores e texto
+livre permanecem `character`; e campos categóricos são fatores por
+padrão.
+
+Confira os tipos antes de aplicar transformações específicas da análise:
 
 ``` r
 
 sim <- process_sim(sim_raw)
 
-sim$DTOBITO <- as.Date(sim$DTOBITO)
-sim$IDADEanos <- as.integer(sim$IDADEanos)
+class(sim$DTOBITO)
+class(sim$IDADEanos)
+class(sim$SEXO)
 ```
 
-Faça a conversão depois de inspecionar códigos especiais, ausências e
-mudanças de layout. O livro de SIS apresenta checklists e seções de
-estrutura dos dados para cada sistema.
+Use `labels = "character"` para devolver descrições categóricas como
+texto ou `labels = "none"` para manter os códigos de origem. Códigos não
+cobertos pela relação oficial continuam visíveis, em vez de serem
+transformados silenciosamente em `NA`. Com `diagnostics = TRUE`, falhas
+de coerção e códigos desconhecidos ficam disponíveis em
+[`processing_diagnostics()`](https://rfsaldanha.github.io/microdatasus/reference/processing_diagnostics.md).
 
 ## Posso baixar várias UFs de uma vez?
 
@@ -284,7 +382,46 @@ do DBF:
 dados <- read_dbc("arquivo.dbc", as_character = FALSE)
 ```
 
-O DBF intermediário é temporário e removido automaticamente.
+O pacote descomprime e interpreta o fluxo diretamente, sem criar um DBF
+intermediário. Layout, registros e CRC32 são validados antes do retorno.
+Use `vars` para ler somente as colunas necessárias sem deixar de
+verificar a estrutura completa do arquivo.
+
+## O que fazer diante de aviso de codificação ou caracteres multibyte?
+
+O padrão `encoding = "auto"` combina o marcador de página de código do
+DBF com evidência dos bytes de cada coluna e linha. Texto identificado
+com segurança é convertido para UTF-8. Sequências ambíguas e
+identificadores binários são preservados sem perda com
+`Encoding(x) == "bytes"` e produzem um aviso.
+
+Se a origem do arquivo for conhecida, um valor explícito exige uma
+leitura estrita:
+
+``` r
+
+dados_cp850 <- read_dbc("arquivo_historico.dbc", encoding = "CP850")
+```
+
+Uma sequência incompatível com o `encoding` informado gera
+`microdatasus_dbc_encoding_error`; nenhum caractere substituto é
+inserido. Os cinco bytes indefinidos do Windows-1252 são tratados da
+mesma forma no Windows, Linux e macOS. Consulte [Formatos DBC, DEF e
+CNV](https://rfsaldanha.github.io/microdatasus/articles/formatos-dbc-def-cnv.md)
+antes de forçar uma codificação.
+
+## Como são resolvidos códigos repetidos em CNV ou DBF?
+
+O parser usa a última ocorrência física aplicável, como o TabWin. Em
+CNV, um código posterior substitui o anterior e uma categoria repetida
+usa sua última descrição não vazia. Em tabelas DBF relacionadas, a
+última linha com a mesma chave é usada.
+
+Conflitos de chave DBF e divergências entre a quantidade de categorias
+declarada e observada no CNV não são ocultados:
+[`datasus_variables()`](https://rfsaldanha.github.io/microdatasus/reference/datasus_variables.md)
+os marca como `fallback`, com `issue_class` e mensagem explicativa.
+Relações ambíguas não são escolhidas por aproximação.
 
 ## Por que o DataSUS não está acessível?
 
@@ -300,6 +437,8 @@ paralelas.
   sistema](https://rfsaldanha.github.io/microdatasus/articles/exemplos.md)
 - [Download e
   rastreabilidade](https://rfsaldanha.github.io/microdatasus/articles/download-e-rastreabilidade.md)
+- [Formatos DBC, DEF e
+  CNV](https://rfsaldanha.github.io/microdatasus/articles/formatos-dbc-def-cnv.md)
 - [Referência das
   funções](https://rfsaldanha.github.io/microdatasus/reference/index.md)
 - [Livro *Sistemas de Informação em Saúde no
